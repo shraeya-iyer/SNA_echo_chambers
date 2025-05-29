@@ -1,0 +1,668 @@
+---
+title: "Echo Chambers Descriptive"
+author: "Stephen, Shraeya, Jonah"
+date: today
+format: 
+  pdf:
+      toc: true
+      toc-depth: 4
+      shift-heading-level-by: 2
+      fig-pos: "H"
+      fig-cap-location: top
+      geometry:
+        - top=1in
+        - right=.8in
+        - bottom=1in
+        - left=.8in
+      link-citations: true
+      linkcolor: blue
+      include-in-header: 
+        text: |
+          \usepackage{fancyhdr}
+          \usepackage{titling}
+          \pagestyle{fancy}
+          \fancyhf{}
+          \renewcommand\maketitle{
+            \fancyhead[C]{
+              \thetitle
+              \ifx \theauthor\empty  \else \ – \theauthor \fi
+              \ifx \thedate\empty  \else \ – \thedate \ \fi
+            }
+          }
+          \fancyfoot[C]{\thepage}
+---
+
+```{r}
+#| echo: false
+#| output: false
+#| message: false
+
+######################################################################################
+# Clear your global environment
+######################################################################################
+rm(list=ls())
+
+######################################################################################
+# Set current directory
+######################################################################################
+
+# Start by telling R where to look for your files.
+# From the menu, select "Session > Set Working Directory... > To Source File Location".
+
+# Alternatively, if you know the filename, you can uncomment the line below and run it.
+# setwd("replace this with the file path to your directory")
+
+# Please do one of the two alternatives above. This is where the files R produces will be stored.
+
+# Run this line of code to see if your current working directory has all of the files needed for this assignment
+list.files()
+
+######################################################################################
+# The first time you run this file, you will need to install several packages.
+# To do that, run the code section below. It may take up a couple of minutes.
+# You only need to install packages once, next time you should skip those lines.
+list.of.packages <- c("tidytext", "tidygraph","ggraph","igraph","tidyverse","topicmodels","textstem","udpipe", "tinytex")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+# Now run the lines below to load the packages you have installed.
+# You need to load packages every time you run the script or restart R.
+library(readr)
+library(tidytext)
+library(tidygraph)
+library(ggraph)
+library(igraph)
+library(tidyverse)
+library(topicmodels)
+library(textstem)
+library(udpipe)
+library(dplyr)
+
+# To check whether your R loads these packages, run the following code
+sessionInfo() ## check other attached packages. If readr, tidytext, tidygraph, ggraph, 
+              ## igraph, tidyverse, topicmodels and textstem are listed there, you're ready!
+```
+
+```{r}
+#| echo: false
+#| output: false
+#| message: false
+
+######################################################################################
+# Downloading NLP Procedure
+######################################################################################
+
+# download the udpipe model
+eng <- udpipe_download_model(language = "english")
+
+###########################################
+# Check confirm that the model has downloaded into your current working directory
+# Update the file name below to match the name of the file
+
+udmodel <- udpipe_load_model(file = "english-ewt-ud-2.5-191206.udpipe")
+###########################################
+```
+
+## Assignment Description:
+
+In this lab, you will be collecting and visualizing network data using the statistical programming language R. The goal is to use network analysis methods to compare collective intelligence and artificial intelligence. You will start by choosing a topic of interest (e.g., the Medici family). Then, you will collect multiple paragraphs of text on that topic from:
+
+-   One or more crowdsourced collective intelligence knowledge-base (e.g., Wikipedia, Reddit, Stack Exchange, Quora, etc.)
+
+-   Chatbody, an AI-powered knowledge-base
+
+You will import each body of text into R and generate networks such that each node represents a word and each link between nodes represents two words that occur near each other.
+
+You will create three networks: (1) collective intelligence text network, (2) artificial intelligence text network, and (3) combined collective and artificial intelligence text network. For networks (1) and (2) you will perform topic modeling using Latent Dirichlet Allocation (LDA) to identify the "topics" within each body of text and use them as nodal attributes of the network. Finally, you will experiment with different visualizations of one of the networks.
+
+# PART I: Network Data Collection **(20 points)**
+
+For this lab, you will collect text from one or more crowdsourced knowledge-bases and Chatbody, save the data from the search, create networks from the data, and compare the differences among networks. To begin, complete the following three steps:
+
+1.  Choose a topic for your text: Echo Chambers
+
+    *Note, you can decide on the topic based on personal interests, research interests, or popular topical areas, among others. You have flexibility in selecting your topic.*
+
+    Example Topic Choice: The Medici Family
+
+2.  Collect text related to this topic:
+
+    For the collective intelligence source (e.g., Wikipedia, Reddit, Stack Exchange, Quora, etc.), you should find a single webpage that contains an overview of your topic. For Chatbody, you should ask it to generate an overview of your topic.
+
+    Example collective intelligence source: Wikipedia -\> Florence (sections)
+
+    -   Rise of the Medici
+
+    -   Savonarola, Machiavelli, and the Medici popes
+
+    Example Chatbody prompts:
+
+    -   "Tell me about relationships built by the Medici family during the Renaissance in Florence"
+
+    -   "Tell me about the connections between the Medici and artists"
+
+3.  Finally, copy/paste the information from both types of sources in the corresponding .txt files in your current working directory (the same folder that this code file is in on your computer): copy/paste the replies from Chatbody into the 'chatbody.txt' file and copy/paste the text from a collective intelligence source (e.g., Wikipedia) into the 'title.txt' file. Do not forget to save the files after pasting.
+
+```{r}
+#| echo: false
+#| output: false
+
+######################################################################################
+# Load and Process Reddit Hyperlink Data for Echo Chamber Analysis
+######################################################################################
+
+library(readr)
+library(dplyr)
+library(tidyr)
+
+# Step 1: Load the data (skipping header row)
+body_data <- read_tsv("soc-redditHyperlinks-body.tsv", col_names = FALSE, skip = 1)
+title_data <- read_tsv("soc-redditHyperlinks-title.tsv", col_names = FALSE, skip = 1)
+
+# Step 2: Rename columns for clarity
+colnames(body_data) <- colnames(title_data) <- c(
+  "SOURCE_SUBREDDIT", "TARGET_SUBREDDIT", "POST_ID", "TIMESTAMP", "POST_LABEL", "POST_PROPERTIES"
+)
+
+# Step 3: Convert POST_PROPERTIES from string to numeric matrix
+split_properties <- function(data) {
+  props <- strsplit(data$POST_PROPERTIES, ",") %>%
+    lapply(as.numeric) %>%
+    do.call(rbind, .) %>%
+    as.data.frame()
+  colnames(props) <- paste0("PROP_", 1:86)
+  return(bind_cols(data %>% select(-POST_PROPERTIES), props))
+}
+
+body_data_full <- split_properties(body_data)
+title_data_full <- split_properties(title_data)
+
+# Step 4: Select the columns of interest
+filtered_body <- body_data_full %>% select(
+  POST_LABEL,
+  PROP_19, PROP_20, PROP_21,    # VADER Sentiment
+  PROP_27, PROP_29, PROP_44,    # Social references
+  PROP_50, PROP_51, PROP_52,    # Negative emotions
+  PROP_54, PROP_55, PROP_56, PROP_57  # Cognitive processes
+)
+
+filtered_title <- title_data_full %>% select(
+  POST_LABEL,
+  PROP_19, PROP_20, PROP_21,
+  PROP_27, PROP_29, PROP_44,
+  PROP_50, PROP_51, PROP_52,
+  PROP_54, PROP_55, PROP_56, PROP_57
+)
+
+# Step 5: Rename for clarity
+colnames(filtered_body) <- colnames(filtered_title) <- c(
+  "POST_LABEL",
+  "VADER_Pos", "VADER_Neg", "VADER_Compound",
+  "LIWC_You", "LIWC_They", "LIWC_Social",
+  "LIWC_Negemo", "LIWC_Anx", "LIWC_Anger",
+  "LIWC_CogMech", "LIWC_Insight", "LIWC_Cause", "LIWC_Discrep"
+)
+
+# Step 6: (Optional) View or write to CSV
+head(filtered_body)
+write_csv(filtered_body, "filtered_body_data.csv")
+write_csv(filtered_title, "filtered_title_data.csv")
+
+
+```
+
+We recommend that you run the code one line at a time, paying attention to what each line of code is doing and observing the output in the R console. Some details to note:
+
+-   The raw text is initially "cleaned" by:
+    -   Removing stop words (words that are frequent but provide little information -- e.g., "I", "the", "we'll", "it's", etc.)
+
+    -   Lemmatization (grouping together different inflected forms of the same word -- e.g., the lemma of "ran", "runs", and "running" is simply "run")
+
+    -   Proper noun detection
+-   The network ties represent words that co-occur in the text within 3 words of each other
+-   LDA is used to group the words into 3 topics
+-   You may need to manually clean the data after running the code
+
+```{r}
+#| echo: false
+#| output: false
+
+######################################################################################
+# Network Generation from the Text
+######################################################################################
+
+# combine the data into a tibble format
+text = tibble(body = body_text, title = title_text)
+
+text$body <- enc2utf8(text$body)
+text$title <- enc2utf8(text$title)
+
+# This step will use the "udpipe" package to label proper nouns in the text
+# Below labels text collected from Chatbody
+body_entities <- udpipe_annotate(udmodel,text$body) |>
+  as.data.frame() |>
+  filter(upos=="PROPN") |>
+  group_by(lemma) |>
+  summarise(n=n())
+
+# This labels text collected from a collective intelligence source
+hmn_entities <- udpipe_annotate(udmodel, text$title) |> 
+  as.data.frame() |>
+  filter(upos=="PROPN") |> 
+  group_by(lemma) |> 
+  summarise(n=n())
+
+# This combines the text from the body and title sources into a dataframe
+# lemmatizes text (combines similar words) and removes duplicates.
+both_entities <- rbind(body_entities,hmn_entities) |>
+  mutate(lemma=tolower(lemma)) |>
+  select(lemma) |>
+  distinct()
+
+# create edgelist from text skipngrams
+# skip_ngrams are pairs of words that appear within k = 3 words of each other
+# df_skip produced a dataframe with four columns:
+# 1. name = source of text
+# 2. skip_1 = the first word in the pair
+# 3. skip_2 = the second word in the pair
+# 4. n = the number of co-occurrences in the entire source text
+df_skip <- text |> 
+  pivot_longer(cols= c(body, title)) |>
+  unnest_tokens(skipgrams, value, token = "skip_ngrams", n = 2, k = 3) |>  
+  separate_wider_delim(cols=skipgrams, 
+                       delim = " ", names = c("skip_1", "skip_2"),
+                       too_few = "align_start") |> 
+  mutate(skip_1 = textstem::lemmatize_words(skip_1),
+         skip_2 = textstem::lemmatize_words(skip_2)) |>
+  na.omit() |> 
+  filter(!skip_1 %in% stop_words$word) |>
+  filter(!skip_2 %in% stop_words$word) |>
+  filter(skip_1 %in% both_entities$lemma & skip_2 %in% both_entities$lemma) |>
+  filter(skip_1!= skip_2) |> 
+  count(name, skip_1, skip_2, sort = TRUE)
+
+######################################################################################
+```
+
+Now, we're going to take a break from R. Let's pause and clean up our data.
+
+```{r}
+#| echo: false
+#| output: false
+
+# Run line 224 to generate a .csv file containing the formatted edgelist (pairs of proper
+# nouns that co-occur within 3 words of each other)
+
+write.csv(df_skip,"df_skip.csv")
+
+# If you don't feel like generating a .csv file, you can also view the dataframe in R.
+# View(df_skip)
+
+# Read the text in .csv and look for tokens (words) that should be removed.
+# Update the exclusions list below to include any proper nouns that aren't
+# appropriate for your network analysis.
+
+exclusions <- c("di","de","da","conspiracy","ii","vii","viii",
+                "bank","pope","magnificent")
+
+# Update df_skip to remove words in the exclusions list.
+df_skip <- df_skip |>
+  filter(!skip_1 %in% exclusions) |>
+  filter(!skip_2 %in% exclusions)
+
+# Take a look at df_skip to confirm that you have removed any inappropriate terms
+# View(df_skip)
+
+######################################################################################
+# Rerun the lines above (from "exclusions" to "View(df_skip)"), updating the list of exclusions each time, until you will get a desired result
+######################################################################################
+```
+
+Your df_skip object should now contain relevant proper nouns that are interesting for you to connect.
+
+```{r}
+#| echo: false
+#| output: false
+
+######################################################################################
+# Reformatting and filtering dataframes
+######################################################################################
+# generate a dataframe containing only body text
+df_body <-  df_skip |>
+  filter(name == "body")
+
+# generate a dataframe containing only title text
+df_hmn <-  df_skip |>
+  filter(name == "title")
+
+# create a combined graph object
+df_both <- df_skip |> 
+  select(skip_1,skip_2, name)
+
+# convert dataframe to long format to see all words
+df_long <- df_both |> 
+  pivot_longer(
+    cols = c(skip_1, skip_2), 
+    names_to = "source",
+    values_to = "word")
+
+# create a dataframe which labels the text source of the word (title, body, or both)
+vertex_labels <- df_long |> distinct(word) |>
+  left_join(distinct(df_long |> select(word,name) |> filter(name == "body"))) |>
+  left_join(distinct(df_long |> select(word,name) |> filter(name == "title")),by=join_by(word)) |>
+  mutate(source = case_when(is.na(name.x)~"title",is.na(name.y)~"body",T~"both")) |>
+  select(word,source)
+
+# generate a labeled graph
+# data_graph represents the combined artificial and collective intelligence semantic networks
+data_graph <- graph_from_data_frame(df_both, vertices = vertex_labels) |>
+  as_tbl_graph() |>
+  as.undirected()
+
+######################################################################################
+# Topic Modeling
+######################################################################################
+
+# first transform the text into a document-term matrix
+text_dtm <- text |>
+  pivot_longer(cols= c(body, title)) |>
+  unnest_tokens(word, value) |>
+  mutate(word = textstem::lemmatize_words(word)) |> # this line performs lemmatization, standardizing words
+  filter(!word %in% stop_words$word) |> # this line removes stop words (insignificant words for analysis)
+  count(name, word, sort = TRUE)|>
+  cast_dtm(name,word,n)
+
+# perform LDA analysis to group topics
+# the number of topics selected was k = 3
+text_lda <- LDA(text_dtm, k = 3, control = list(seed = 1234))
+
+# create the topic map
+# uses LDA to group words into topics
+topic_map <- augment(text_lda, data = text_dtm) |>
+  filter(count>2) |>
+  select(term, .topic) |>
+  distinct() |>
+  add_row(term=c("title","body"),.topic=0,.before=0) |>
+  group_by(term) |>
+  mutate(n_topics = row_number()) |>
+  filter(n_topics == 1) |>
+  ungroup()
+
+# body_graph represents the artificial intelligence network
+body_graph <- df_body |> 
+  # filter(n>=1) |>
+  select(skip_1,skip_2, name) |>
+  graph_from_data_frame() |>
+  as_tbl_graph() |>
+  left_join(topic_map, by = c("name" = "term")) |>
+  mutate(topic = `.topic` |> as_factor()) |>
+  # filter(topic==3) |>
+  as.undirected()
+
+# hmn_graph represents the collective intelligence network
+hmn_graph <- df_hmn |> 
+  # filter(n>2) |>
+  select(skip_1,skip_2, name) |>
+  graph_from_data_frame() |>
+  as_tbl_graph() |>
+  left_join(topic_map, by = c("name" = "term")) |>
+  mutate(topic = `.topic` |> as_factor()) |>
+  as.undirected()
+```
+
+## 1. Provide a high-level overview of the text you included in the data collection. **(5 points)**
+
+*Why did you choose this collection of text? Was there a specific, overarching question (intellectual or extracurricular curiosity) that motivated this collection of text?*
+
+My data is ...
+
+## 2. What are the insights you hope to glean by looking at these text networks? **(2 points)**
+
+*For instance, which words do you think would have the highest degree centrality and why?*
+
+I hope to ...
+
+## 3. Are the graphs directed or undirected? **(2 points)**
+
+My graph is ...
+
+I know this because ...
+
+```{r}
+# check if the networks are directed or undirected
+is_directed(data_graph)
+is_directed(body_graph)
+is_directed(hmn_graph)
+```
+
+## 4. How many nodes and links does the AI network have? **(2 points)**
+
+The AI network has ...
+
+```{r}
+# check the size of the networks
+vcount(data_graph) ## the number of nodes
+ecount(data_graph) ## the number of edges
+
+vcount(body_graph) ## the number of nodes
+ecount(body_graph) ## the number of edges
+
+vcount(hmn_graph) ## the number of nodes
+ecount(hmn_graph) ## the number of edges
+```
+
+::: {.callout-note style="color:blue"}
+Check how many nodes and edges exist in the network. Make sure that each network includes **around 50 or more nodes**. DO NOT collect data including more than 1,000 nodes, as it can slow down the lab’s code substantially. To increase or decrease the number of nodes, modify the amount of text gathered from each respective source. You may need to look at multiple related sources of collective intelligence or send multiple prompts to Chatbody to gather more data.
+
+You can also modify k in unnest_tokens(skipgrams, value, token = "skip_ngrams", n = 2, k = 3) to increase the density of the network
+:::
+
+## 5. How many possible links could there be in the AI network based on the number of nodes? **(2 points)**
+
+The number of possible links the AI network could have is ...
+
+```{r}
+# Hint: the calculation differs for directed vs. undirected networks
+
+```
+
+## 6. What is the density of the AI network? **(2 points)**
+
+The density of the AI network is ...
+
+```{r}
+# calculate the density of the networks
+edge_density(data_graph)
+edge_density(body_graph)
+edge_density(hmn_graph)
+```
+
+## 7. Briefly describe how your choice of dataset may influence your findings. **(5 points)**
+
+*What differences would you expect if you use different text sources (e.g., Reddit vs. Wikipedia) or a different topic?*
+
+By choosing my dataset this way....
+
+## Save your data
+
+```{r}
+#| echo: false
+#| output: false
+########################
+# Save your data       
+########################
+
+# The following command saves your R environment as RData
+# Please submit this RData on Canvas
+save.image('Lab1_Descriptive.RData')
+
+# Next time, you need to work on the same data, you can run the following command.
+# This allows you to recover and load the same data you found if you need to restart R
+# Make sure that you put the RData in your working directory
+load('Lab1_Descriptive.RData')
+# Save this .RData in case you would like to use it for future projects
+
+######################################################################################
+```
+
+# PART II: Network Visualization **(15 points)**
+
+In this part, using the data you are collecting, you will visualize the network and interpret these visualizations. Include a copy of the network plots you generate in your assignment.
+
+Complete the following by modifying the code below.
+
+## Basic Network Visualization
+
+Choose ONE: (1) Your collective intelligence graph OR (2) Your artificial intelligence graph, and complete the following questions based on your chosen graph.
+
+## 1. How many components are in this graph? **(1 points)**
+
+```{r}
+# Calculate the number of components in the graph
+body_comp <- igraph::components(body_graph); body_comp
+hmn_comp <- igraph::components(hmn_graph); hmn_comp
+```
+
+## 2. Create a visualization of the whole network and include it in your report (the first visualization). Then, in a paragraph, comment on the items described below. **(3 points)**
+
+*Describe the macro-level structure of your graph based on the visualization.* *For example, is the network composed of a giant, connected component, are there distinct sub-components, or are there isolated components? Can you recognize common features of the sub-components? Does this visualization give you any insight into the interaction patterns of your topic? If yes, what? If not, why? Note, if it's too hard to tell the macro-level structure from the visualization, experiment with different plot options (increase the node size, reduce the arrow size, etc.).*
+
+```{r}
+
+########################
+# Plotting   
+########################
+
+# For a more detailed tutorial of network visualization, see https://kateto.net/network-visualization
+# To open documentation in RStudio, run:
+# help("igraph.plotting")
+
+# Now, visualize the network - below, we plot the AI network as an example
+# If you want to visualize the collective intelligence network instead, just replace "body" with "hmn" everywhere
+
+## plot the original AI network
+plot(body_graph, vertex.size = 7, vertex.label = NA,
+     # Settings for layouts:
+     #      Running this command multiple times will produce slightly different networks,
+     #      based on the layout algorithm used. You can swap algorithms by uncommenting one of the
+     #      lines below. Which algorithm works best often depends on the data
+     # layout = layout_nicely(body_graph)      ## Automated layout recommendation from iGraph
+     # layout = layout_with_fr(body_graph)    ## Fruchterman-Reingold algorithm
+     # layout = layout_with_dh(body_graph)    ## Davidson and Harel algorithm
+     # layout = layout_with_drl(body_graph)   ## Force-directed algorithm
+     # layout = layout_with_kk(body_graph)    ## Spring algorithm
+     # layout = layout_with_lgl(body_graph)   ## Large graph layout
+)
+```
+
+Based on my visualization, ...
+
+## 3. Create a second visualization, now using only the single largest component of the network (i.e., "giantGraph" if you work with the provided R code) and include it in your report. Then, in a paragraph, comment on the items described below. **(3 points)**
+
+*Again, if it's too hard to discern the structure of the component from the visualization, experiment with different plot options. Are there any differences between the first visualization and second one? If so, why? If not, why not? (If your whole network already had only one component to start with, the first and the second plots should be very similar. This is ok. Explain why the visualizations are similar or slightly different.)*
+
+```{r}
+# Take out the largest component from each graph
+
+# start with the AI network
+body_comp <- igraph::components(body_graph)
+giantGraph_body <- body_graph |>  
+  induced_subgraph(., which(body_comp$membership == which.max(body_comp$csize)))
+
+# now repeat steps with the collective intelligence network
+hmn_comp <- igraph::components(hmn_graph)
+giantGraph_hmn <- hmn_graph |>  
+  induced_subgraph(., which(hmn_comp$membership == which.max(hmn_comp$csize)))
+
+## plot the largest component of the AI network
+plot(giantGraph_body, vertex.size = 7, vertex.label = NA,
+     # Settings for layouts:
+     #      Running this command multiple times will produce slightly different networks,
+     #      based on the layout algorithm used. You can swap algorithms by uncommenting one of the
+     #      lines below. Which algorithm works best often depends on the data
+     # layout = layout_nicely(giantGraph_body)      ## Automated layout recommendation from iGraph
+     # layout = layout_with_fr(giantGraph_body)    ## Fruchterman-Reingold algorithm
+     # layout = layout_with_dh(giantGraph_body)    ## Davidson and Harel algorithm
+     # layout = layout_with_drl(giantGraph_body)   ## Force-directed algorithm
+     # layout = layout_with_kk(giantGraph_body)    ## Spring algorithm
+     # layout = layout_with_lgl(giantGraph_body)   ## Large graph layout
+)
+```
+
+Based on my visualization, ...
+
+Compared to my first visualization, this one is ...
+
+## 4. Create a third visualization using a different 'igraph' layout option from (2) and (3) and include it in your report. Then, in a paragraph, comment on the items described below. **(3 points)**
+
+*Experiment with different visualization options to make your layout better or to add additional information to the plot. Explain your choice of visualization options. In a few sentences, describe what types of observations are easier to make using one plot or the other.*
+
+```{r}
+# Add your own code here
+
+
+```
+
+## Topic Modeling
+
+Complete the following questions based on the same graph that you chose for the Basic Network Visualization portion of this assignment.
+
+## 1. Plot the combined graph with nodes colored based on which text it appeared in (i.e., "data_graph" if you work with the provided R code without adjustments). Then, in a paragraph, comment on the items described below. **(2 points)**
+
+*What do you observe about the words that exist in the collective intelligence text vs. the artificial intelligence text vs. both? Is there a lot of overlap across the text sources? Does this surprise you?*
+
+```{r}
+#| echo: false
+
+# Below,the network object is passing to the plot command using '|>'
+# plot the combined network with node color representing which text the word belongs to: collective, artificial, or both
+data_graph |>
+  as_tbl_graph() |>
+  ggraph(layout = 'fr')+
+  geom_edge_link2()+
+  geom_node_label(aes(label = name,colour=source))+ # color nodes by source text
+  theme_void()
+```
+
+## 2. Plot the collective intelligence network AND the artificial intelligence network with nodes colored based on topic (if you use the provided R code without any adjustments, the networks should have 3 topics each). Then, comment on the items described below. **(3 points)**
+
+*How are the words grouped together? What topics do you think each network contains?*
+
+```{r}
+#| echo: false
+
+# now we will analyze the separate artificial vs. collective intelligence semantic networks
+# plot the artificial intelligence semantic network with node color representing topic
+body_graph |>
+  as_tbl_graph() |>
+  ggraph(layout = 'fr')+
+  geom_edge_link2()+
+  geom_node_label(aes(label = name, colour=topic))+ # color nodes by topic
+  theme_void()
+
+# plot the collective intelligence semantic network with node color representing topic
+hmn_graph |>
+  as_tbl_graph() |>
+  ggraph(layout = 'fr')+
+  geom_edge_link2()+
+  geom_node_label(aes(label = name,colour=topic))+
+  theme_void()
+```
+
+## 3. Disclose AI Use
+
+I used ... to generate ... for this lab
+
+## 4. Export and Submit 3 Files
+
+Check your submission for grammar - points may be deducted for lack of clarity.
+
+Click 'Render' button at the top of the screen, or press cmd + shift + k. Note. It might take some time for you computer to render this document as a PDF, since it will be running all code chunks.
+
+Deliverables to submit on Canvas:
+
+1.  Your report as a .pdf file
+2.  Your code as a .qmd file
+3.  Your data as a .RData file
+
+Please upload each file separately -- do not upload as a zip file! *(Please)*
