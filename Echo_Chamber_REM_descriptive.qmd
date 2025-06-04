@@ -1,0 +1,566 @@
+---
+title: "Echo Chambers Relational Event Modeling (REM) Descriptive Analytics"
+author: "Stephen, Shraeya, Jonah, Caroline, Anna"
+date: today
+format: 
+  pdf:
+      toc: true
+      toc-depth: 4
+      shift-heading-level-by: 2
+      fig-pos: "H"
+      fig-cap-location: top
+      geometry:
+        - top=1in
+        - right=.8in
+        - bottom=1in
+        - left=.8in
+      link-citations: true
+      linkcolor: blue
+      include-in-header: 
+        text: |
+          \usepackage{fancyhdr}
+          \usepackage{titling}
+          \pagestyle{fancy}
+          \fancyhf{}
+          \renewcommand\maketitle{
+            \fancyhead[C]{
+              \thetitle
+              \ifx \theauthor\empty  \else \ – \theauthor \fi
+              \ifx \thedate\empty  \else \ – \thedate \ \fi
+            }
+          }
+          \fancyfoot[C]{\thepage}
+---
+```{r}
+#| echo: false
+#| output: false
+#| message: false
+
+######################################################################################
+# Clear your global environment
+######################################################################################
+rm(list=ls())
+
+# Load necessary packages
+library(readr)
+library(dplyr)
+library(tidyr)
+library(igraph)
+library(relevent)
+
+# Set seed for reproducibility
+set.seed(42)
+
+sessionInfo()
+
+######################################################################################
+# Load data: same as your current pipeline
+######################################################################################
+
+body_data <- read_tsv("soc-redditHyperlinks-body.tsv", col_names = FALSE, skip = 1)
+title_data <- read_tsv("soc-redditHyperlinks-title.tsv", col_names = FALSE, skip = 1)
+
+colnames(body_data) <- colnames(title_data) <- c(
+  "SOURCE_SUBREDDIT", "TARGET_SUBREDDIT", "POST_ID", "TIMESTAMP", "POST_LABEL", "POST_PROPERTIES"
+)
+
+# Combine body + title into a single dataframe
+combined_data <- bind_rows(body_data, title_data)
+
+######################################################################################
+# Convert TIMESTAMP to proper time format
+######################################################################################
+
+combined_data$TIMESTAMP <- as.POSIXct(combined_data$TIMESTAMP, format="%Y-%m-%d %H:%M:%S", tz="UTC")
+combined_data <- combined_data %>% arrange(TIMESTAMP)
+```
+
+```{r}
+#| label: load-parse-data
+#| echo: false
+
+# Load body and title data
+body_data <- read_tsv("soc-redditHyperlinks-body.tsv", col_names = FALSE, skip = 1)
+title_data <- read_tsv("soc-redditHyperlinks-title.tsv", col_names = FALSE, skip = 1)
+
+# Rename columns
+colnames(body_data) <- colnames(title_data) <- c(
+  "SOURCE_SUBREDDIT", "TARGET_SUBREDDIT", "POST_ID", "TIMESTAMP", "POST_LABEL", "POST_PROPERTIES"
+)
+
+# Define split_properties function (standalone!)
+split_properties <- function(data) {
+  props <- strsplit(data$POST_PROPERTIES, ",") %>%
+    lapply(as.numeric) %>%
+    do.call(rbind, .) %>%
+    as.data.frame()
+  colnames(props) <- paste0("PROP_", 1:ncol(props))
+  return(bind_cols(data %>% select(-POST_PROPERTIES), props))
+}
+
+# Parse POST_PROPERTIES
+body_data_full <- split_properties(body_data)
+title_data_full <- split_properties(title_data)
+
+# Combine body + title
+combined_data_full <- bind_rows(body_data_full, title_data_full)
+
+# Convert TIMESTAMP to POSIXct
+combined_data_full$TIMESTAMP <- as.POSIXct(combined_data_full$TIMESTAMP, format="%Y-%m-%d %H:%M:%S", tz="UTC")
+
+# Sort by time
+combined_data_full <- combined_data_full %>% arrange(TIMESTAMP)
+```
+```{r}
+#| label: subset-topN
+#| echo: false
+
+# 0. How many top subreddits?
+N_top <- 50          # ← using ten is fine for a fast diagnostic run
+
+# 1. Pick the N most active sources
+subreddit_activity <- combined_data_full %>%
+  count(SOURCE_SUBREDDIT, name = "n") %>%
+  arrange(desc(n))
+
+top_subs <- subreddit_activity$SOURCE_SUBREDDIT[1:N_top]
+
+# 2. Keep events where BOTH ends are in the top set
+combined_data_top <- combined_data_full %>%
+  filter(SOURCE_SUBREDDIT %in% top_subs,
+         TARGET_SUBREDDIT %in% top_subs)
+
+# 3. Thin events – keep every 5th row  (★ done BEFORE actor map)
+combined_data_top <- combined_data_top[
+  seq(1, nrow(combined_data_top), by = 5), ]
+
+# 4. Rebuild actor list and ID map **after** thinning
+unique_subs  <- unique(c(combined_data_top$SOURCE_SUBREDDIT,
+                         combined_data_top$TARGET_SUBREDDIT))
+actor_id_map <- setNames(seq_along(unique_subs), unique_subs)
+
+# 5. Add sender / receiver IDs
+combined_data_top$sender   <- actor_id_map[combined_data_top$SOURCE_SUBREDDIT]
+combined_data_top$receiver <- actor_id_map[combined_data_top$TARGET_SUBREDDIT]
+
+
+```
+
+```{r}
+#| label: eventlist
+#| echo: false
+
+################################################################################
+# EVENTLIST – build edgelist matrix with time first
+################################################################################
+
+## 1. Create a numeric event_time (seconds since first event)
+start_time <- min(combined_data_top$TIMESTAMP, na.rm = TRUE)
+
+combined_data_top <- combined_data_top %>%
+  mutate(event_time = as.numeric(difftime(TIMESTAMP,
+                                          start_time,
+                                          units = "secs")))
+
+## 2. Choose a bin size and assign events to bins
+bin_size <- 86400 # daily bins
+combined_data_top <- combined_data_top %>%
+  mutate(time_bin = floor(event_time / bin_size))
+
+## 3. Collapse to one event per (sender, receiver, time_bin)
+collapsed_events <- combined_data_top %>%
+  group_by(sender, receiver, time_bin) %>%
+  summarise(n_links = n(), .groups = "drop") %>%
+  arrange(time_bin)
+
+## 4. Build the edgelist matrix – TIME FIRST
+data_rem_small <- collapsed_events %>%
+  arrange(time_bin, sender, receiver) %>%
+  transmute(
+    time    = as.numeric(time_bin),   # 1️⃣ time column
+    sender  = sender,                 # 2️⃣ sender column
+    receiver = receiver               # 3️⃣ receiver column
+  ) %>%
+  as.matrix()
+
+## 5. Break ties by adding tiny jitters (0, 1e‑6, 2e‑6, …)
+data_rem_small[, 1] <- data_rem_small[, 1] +
+  ave(data_rem_small[, 1], data_rem_small[, 1],
+      FUN = function(x) (seq_along(x) - 1) * 1e-6)
+
+## 6. Sanity check – must be strictly increasing
+stopifnot(all(diff(data_rem_small[, 1]) > 0))
+
+
+```
+
+# **PART I: Defining Hypotheses to Test**
+
+## Hypotheses
+
+### Hypothesis 1: 
+The likelihood of a subreddit i linking to another subreddit j increases if (a) i has linked to j before and (b) if j has linked to i before. 
+Measured by: RSndSnd and RRecSnd (repetition and reciprocity, respectively)
+*Echo chambers should have mutual reinforcement loops among in-group communities, so finding reciprocal linking should show whether this mutual reinforcement is present.*
+
+### Hypotheses 2: 
+The likelihood of a subreddit i linking to subreddit j is greater if j has previously been linked to frequently by other subreddits. 
+Measured by: NTDegRec
+*This measures preferential attachment, where nodes are more likely to connect with nodes who are already central to the network. Highly-linked subreddits may become larger centers of opinions, which could form the core of echo chambers*
+
+### Hypothesis 3a & 3b:
+3a: The likelihood of a subreddit i linking to subreddit j is greater if both subreddits are in the same cluster.
+Measured by: CovInt based on (to be computed) cluster covariate
+**DID NOT END UP TESTING - would have run for minimum of 4 hours to get output and Stephen got enough similar info**
+
+3b: The likelihood of a subreddit i linking to subreddit j is greater if i and j have similar average sentiments.
+Measured by: CovInt with sentiment similarity
+*One of the key identifiers of echo chambers is communicating only with others of similar sentiments/opinions. This tells us whether subreddits are more likely to link to others with similar sentiments to help us understand the formation of echo chambers*
+
+### Hypothesis 4: 
+When an subreddit i links to another subreddit j, j has a greater likelihood of linking back to subreddit i in the next event.
+Measured by: PSAB-BA
+*Quick back and forth linkage between pairs of subreddits reinforces insularity and short feedback loops, which are important elements of echo chambers*
+
+### Hypothesis 5: 
+The likelihood of a subreddit i linking to a subreddit k is greater if i links to a third subreddit j, and j links to k. 
+Measured by: PSAB‑BY
+*In echo chambers, subreddits that propagate information/linkage to other subreddits with similar sentiments extend echo chamber narratives when they form information chains*
+
+## Hypothesis 6:
+The rate of subreddit i linking to other subreddits within its cluster increases over time.
+Measured by: CovSnd with time covariate
+*Burst dynamics are often visualized in the formation of echo chambers. A positive trend would suggest engagement going up quickly and intensely, while negative trends point to fading activity*
+
+# **PART 2: Testing Hypotheses**
+
+## Model 1
+```{r}
+#| label: model1
+#| echo: false
+set.seed(42)
+
+n_actors <- length(unique_subs)          # 200 if N_top <- 200
+stats_intercept <- rep(1, n_actors)  # 1 for every sender
+
+cat("# actors (n):  ", n_actors, "\n")           # should be 100
+cat("# events (m): ", nrow(data_rem_small), "\n")
+
+reddit_model1 <- rem.dyad(
+  edgelist = data_rem_small,
+  n        = n_actors,
+  effects  = c("RSndSnd", "RRecSnd", "CovSnd"),  # repetition, reciprocity, intercept
+  covar    = list(CovSnd = stats_intercept),
+  ordinal  = TRUE,          # ordinal speeds things up; use FALSE if you need exact times
+  hessian  = TRUE          # fit first, add Hessian later if you need s.e.’s
+)
+
+summary(reddit_model1)
+
+```
+
+*Testing Hypothesis 1: The likelihood of a subreddit i linking to another subreddit j increases if (a) i has linked to j before and (b) if j has linked to i before.* 
+
+A strong reciprocity effect here would be when if a subreddit j has recently linked to a subreddit i, i is more likely to link back to j - meaning that the links between i and j are bidirectional. RRecSnd is the statistic we can look at to judge the reciprocity effect: the p-value is far below 0.05, making this a statistically significant finding. The estimate (measurign how much this variable influences the likelihood of an event occurring) is positive and fairly large, showing a strong reciprocity effect. Since this analysis is on the network as a whole, without factoring in clustering, this just tells us that subreddits in general are likely to link back to those that linked to them. To detect echo chambers, we need to find selective reciprocity and determine whether reciprocity is disproportionately concentrated within clusters or distributed evenly across the network, which we'll do with future models in this report. 
+
+A strong repetition effect here is when subreddits are more likely to continue linking to other subreddits that they've linked to frequently in the past. The p-value of RSndSnd, the statistic we look at to judge the repetition effect, is far smaller than 0.05, making the results statistically significant. The estimate is positive and very high (3x RRecSnd) which indicates a very strong repetition effect. This tells us that subreddits have very strong interlinking patterns, where subreddits tend to link to others frequently over time. 
+
+## Model 2
+```{r}
+#| label: model2
+#| echo: false
+# Model 2 – add preferential attachment (NTDegRec)
+
+set.seed(42)
+
+## 0.  Ensure the intercept vector has one entry for every sender
+n_actors        <- length(unique_subs)      # 200 if N_top <- 200
+stats_intercept <- rep(1, n_actors)         # CovSnd = intercept
+
+## 1.  Fit
+reddit_model2 <- rem.dyad(
+  edgelist = data_rem_small,
+  n        = n_actors,
+  effects  = c("RSndSnd",   # repetition: i linked to j before
+               "RRecSnd",   # reciprocity: j linked to i before
+               "NTDegRec",  # preferential attachment (receiver’s in‑degree)
+               "CovSnd"),   # intercept
+  covar    = list(CovSnd = stats_intercept),
+  ordinal  = TRUE,          # ordinal likelihood – much faster, fine for binned time
+  hessian  = TRUE          # skip Hessian on first run; add TRUE later if you need s.e.’s
+)
+
+summary(reddit_model2)
+```
+*Testing Hypotheses 2: The likelihood of a subreddit i linking to subreddit j is greater if j has previously been linked to frequently by other subreddits.*
+
+The p-values of all the previous effects are statistically significant. We see positive coefficients for both the reciprocity and repetition effects.
+
+The p-value of NTDegRec is well below 0.05 (p < 2.2e-16), indicating the result is statistically significant. The estimate is 1.1000e+01 (~11), which is positive and very high. This means that subreddits that have already been frequently linked to are more likely to receive future links — a strong preferential attachment effect.The exponentiated value of this estimate is ~59874.14 which ndicates that highly linked (popular) subreddits are far far more likely to receive future links than less linked subreddits. In the context of echo chambers, this suggests that a small number of highly central subreddits may dominate the flow of links, reinforcing central opinion hubs, which is a trademark of echo chamber formation.
+
+## Computation of clusters and sentiments to be used in model 3
+
+```{r}
+#| label: cluster-covar
+#| echo: false
+
+# Build undirected graph for Louvain clustering
+edge_list <- combined_data_top %>%
+  group_by(SOURCE_SUBREDDIT, TARGET_SUBREDDIT) %>%
+  summarise(n_links = n(), .groups = "drop") %>%
+  filter(SOURCE_SUBREDDIT != TARGET_SUBREDDIT)
+
+g_cluster <- graph_from_data_frame(edge_list, directed = FALSE)
+
+# Louvain clustering
+cl <- cluster_louvain(g_cluster)
+
+# Map cluster membership to every actor
+cluster_membership <- data.frame(
+  subreddit = V(g_cluster)$name,
+  cluster   = cl$membership
+)
+
+node_cov_cluster <- sapply(unique_subs, function(sub) {
+  idx <- match(sub, cluster_membership$subreddit)
+  if (!is.na(idx)) cluster_membership$cluster[idx] else NA
+})
+
+## ──‑‑ Fix: replace missing clusters with singletons
+max_clust <- max(node_cov_cluster, na.rm = TRUE)
+node_cov_cluster[is.na(node_cov_cluster)] <- seq(
+  from = max_clust + 1,
+  length.out = sum(is.na(node_cov_cluster))
+)
+
+CovInt_cluster <- matrix(node_cov_cluster,
+                         ncol = 1,
+                         dimnames = list(NULL, "cluster"))
+
+
+```
+
+
+```{r}
+
+#| label: sentiment-covar
+#| echo: false
+
+# Average sentiment (example uses PROP_21)
+sentiment_estimates <- combined_data_top %>%
+  group_by(SOURCE_SUBREDDIT) %>%
+  summarise(avg_sentiment = mean(PROP_21, na.rm = TRUE), .groups = "drop")
+
+node_sentiment <- sapply(unique_subs, function(sub) {
+  idx <- match(sub, sentiment_estimates$SOURCE_SUBREDDIT)
+  if (!is.na(idx)) sentiment_estimates$avg_sentiment[idx] else NA
+})
+
+## ──‑‑ Fix: mean‑impute any missing sentiment values
+mean_sent <- mean(node_sentiment, na.rm = TRUE)
+node_sentiment[is.na(node_sentiment)] <- mean_sent
+
+# Build similarity matrix (negative absolute distance)
+sent_sim_matrix <- outer(
+  node_sentiment,
+  node_sentiment,
+  FUN = function(x, y) -abs(x - y)
+)
+diag(sent_sim_matrix) <- 0            # zero diagonal
+
+
+```
+
+
+## Model 3
+```{r}
+#| label: model3b_sentiment_similarity
+#| echo: false
+################################################################################
+# Model 3b – tests sentiment similarity only (H3b)
+# Effects: repetition, reciprocity, sentiment CovEvent
+################################################################################
+
+set.seed(42)
+
+## Sentiment similarity matrix is already built: sent_sim_matrix  (n × n)
+
+reddit_model3b <- rem.dyad(
+  edgelist = data_rem_small,
+  n        = length(unique_subs), 
+  effects  = c("RSndSnd",          # repetition
+               "RRecSnd",          # reciprocity
+               "NTDegRec",
+               "CovEvent",          # sentiment similarity (H3b)
+               "CovSnd"),        
+  covar    = list(
+    CovSnd = stats_intercept,   # length‑n vector of 1s
+    CovEvent = sent_sim_matrix     # single dyadic covariate
+  ),
+  ordinal  = TRUE,                 # fast, order‑based likelihood
+  hessian  = TRUE
+)
+
+summary(reddit_model3b)
+
+
+```
+*Testing Hypotheses 3b: The likelihood of a subreddit i linking to subreddit j is greater if i and j have similar average sentiments. Measured by: CovInt with sentiment similarity.*
+
+The p-value for CovEvent, the indicator of sentiment similarity, is well below 0.05, and therefore is statistically signficiant. The covariate is strongly positive, and when the estimate is exponentiatied, we get ~2.77, meaning that for every one-unit increase in average-sentiment similarity between two subreddits, the instantaneous rate of change at which they link is ~2.8x higher. This confirms our hypothesis 3, telling us that subreddits with more aligned sentiments are more likely to connect. In the context of echo chamber formation, it indicates that there are strong ideological homophily-communication flows along lines of shared opinions, which limits exposure to different view points. The control terms (discussed in previous models) show that links accumulate on past dyads and popular subreddits, which show tight information loops. Overall, this model tells us that Reddit hyperlink traffic is driven by ideological alignments of sentiment (along with the other factors we've previously discussed). When put together, these dynamics (so far) mimic the characteristics of echo chambers where users repeatedly engage with like-minded people without communicating much with others with different sentiments.
+
+## Model 4 
+```{r}
+#| label: model4
+#| echo: false
+# Model 4 – adds turn‑taking reciprocity (PSAB-BA)
+
+set.seed(42)
+
+reddit_model4 <- rem.dyad(
+  edgelist = data_rem_small,
+  n        = length(unique_subs),
+  effects  = c("RSndSnd",      # repetition
+               "RRecSnd",      # short‑term reciprocity
+               "NTDegRec",     # preferential attachment
+               "PSAB-BA",      # turn‑taking (j just called i → i calls j)
+               "CovEvent",
+               "CovSnd"),      # sender intercept
+  covar    = list(
+    CovSnd = stats_intercept,  # length‑n vector of 1s
+    CovEvent = sent_sim_matrix
+  ),
+  ordinal  = TRUE,             # faster; keeps order info
+  hessian  = TRUE              # so you get s.e.’s & p‑values
+)
+
+summary(reddit_model4)
+
+```
+*Testing Hypotheses 4: When an subreddit i links to another subreddit j, j has a greater likelihood of linking back to subreddit i in the next event.*
+
+The p-value of PSAB-BA is far below 0.05, so the results are statistically significant. The estimate is ~1.16, which when exponentiatied, yields ~3.18. This means that when j has just linked to i, the likelihood that i immediately links back increases by more than 3x. Hypothesis 4 tells us about the turn taking reciprocity, which is confirmed by the high, positive PSAB-BA. This means subreddits reciprociate quickly, which reinforces dyadic loops. THe presence of turn taking can signal stronger echo chambers, since it tells us that subreddits are repeatedly linking to each other in a reinforcing loop instead of reaching out to new communities. Tight feedback loops of information are created as a result, which are an essential signifier of echo chamber formation. 
+
+```{r}
+#| label: cluster-dyadic
+#| echo: false
+# Build a 0/1 matrix: 1 if two actors share the same Louvain cluster
+
+## node_cov_cluster already holds one cluster label per actor
+## (see cluster‑covar chunk).  Make sure it has no NAs:
+if (anyNA(node_cov_cluster)) {
+  max_cl <- max(node_cov_cluster, na.rm = TRUE)
+  node_cov_cluster[is.na(node_cov_cluster)] <- seq(
+    max_cl + 1,
+    length.out = sum(is.na(node_cov_cluster))
+  )
+}
+
+same_cluster <- outer(
+  node_cov_cluster,
+  node_cov_cluster,
+  FUN = function(a, b) as.numeric(a == b)
+)
+diag(same_cluster) <- 0        # zero on the diagonal (self‑links)
+
+# Quick sanity check
+stopifnot(dim(same_cluster)[1] == length(unique_subs),
+          !anyNA(same_cluster))
+
+```
+
+## Model 5
+```{r}
+#| label: model5
+#| echo: false
+
+
+stats_intercept <- rep(1, n_actors)         # CovSnd = intercept
+
+# 1. build a 3‑D array: [i , j , 1] = same‑cluster,  [i , j , 2] = sentiment
+dyad_cov <- array(0, dim = c(length(unique_subs), length(unique_subs), 2))
+dyad_cov[, , 1] <- same_cluster
+dyad_cov[, , 2] <- sent_sim_matrix
+
+# 2. fit Model 5
+reddit_model5 <- rem.dyad(
+  edgelist = data_rem_small,
+  n        = length(unique_subs),
+  effects  = c("RSndSnd",
+               "RRecSnd",
+               "NTDegRec",
+               "PSAB-BA",
+               "PSAB-BY",
+               "CovEvent",     # sentiment similarity
+               "CovSnd"),
+  covar    = list(
+    CovEvent2 = sent_sim_matrix,
+    CovSnd   = stats_intercept
+  ),
+  ordinal  = TRUE,
+  hessian  = TRUE
+)
+
+summary(reddit_model5)
+
+
+```
+*Testing Hypotheses 5: The likelihood of a subreddit i linking to a subreddit k is greater if i links to a third subreddit j, and j links to k.*
+
+The p-value of PSAB-BY is statistically significant. PSAB-BY measures the information-chain shift: after subreddit i links to subreddit j, j quickly links to a new subreddit k. The coefficient is positive, and it's exponentiated form is ~2.46. This tells us that the likelihood that j links to a third party increases by ~2.5x in comparison with the baseline. PSAB-BY confirms our hypothesis that once two subreddits are engaged, the second subreddit frequently reaches outward to link to new subreddits. This seems like healthy information diffuision at first, but when paired with the other network dynamics we've observed, it reinforces the echo-chamber processes. We learned that there's ideological homophily (that links are more likely made to other subreddits with similar sentiments) and turn taking reciprocity (dyads bounce content back and forth). With the addition of information chains, this tells us that when the link outward is made, it's likely making a connection with another subreddit that's like-minded, which just extends the echo chamber cluster instead of bridging dissenting communities. These chains of communication accelerate the internal reinforcement of narratives while not assisting with cross-cluster exposure, which is a classic marker of echo chambers. 
+
+## Model 6
+```{r}
+#| label: model6
+#| echo: false
+# Model 6 – adds CTriadRec + linear time trend
+
+set.seed(42)
+stats_intercept <- rep(1, n_actors)         # CovSnd = intercept
+
+# build a scaled time vector (length = #events)
+scaled_time <- scale(data_rem_small[, 1])[, 1]
+
+reddit_model6 <- rem.dyad(
+  edgelist = data_rem_small,
+  n        = length(unique_subs),
+  effects  = c("RSndSnd",
+               "RRecSnd",
+               "NTDegRec",
+               "PSAB-BA",
+               "PSAB-BY",
+               "CovEvent",     # sentiment similarity
+               "CovSndTime",
+               "CovSnd"),
+  covar    = list(
+    CovEvent    = sent_sim_matrix,
+    CovSnd      = stats_intercept,
+    CovSndTime  = scaled_time      # length‑m vector; function picks it up
+  ),
+  ordinal  = TRUE,
+  hessian  = TRUE
+)
+
+summary(reddit_model6)
+
+```
+*Testing Hypotheses 6: The rate of subreddit i linking to other subreddits within its cluster increases over time.*
+
+With hypothesis 6, we wanted to check if burst dynamics could be visualized in the subreddit data. The CovSndTime was intended to tell us whether active subreddits become progressively more likely to link as times go on to answer this hypothesis. However, the CovSndTime effect was not outputted. This could potentially mean that there was an identical value at every event (having zero variance), or that it was perfectly colinear with the other terms. Because of this, H6 cannot be evaluated. 
+
+## Model Comparisons
+
+We will compare the BIC of all models that produced successful results (excluding 3a and 6):
+
+Model 1 BIC: 37137.56
+Model 2 BIC: 36679.6
+Model 3b BIC: 36632.36
+Model 4 BIC: 36630.22
+Model 5 BIC: 36569.53
+
+The lowest BIC is model 5, as it has a BIC of 36569.53, meaning we prefer model 5. This means that with preferential attachment, reciprocity and repetition, sentiment similarity, turn taking, and information chains all included in the model, we're best able to model and explain the linkage patterns between subreddits in the overall Reddit network. 
+
+```{r}
+#| label: save env
+save.image(file = "Echo_Chamber_REM_descriptive.RData")
+```
